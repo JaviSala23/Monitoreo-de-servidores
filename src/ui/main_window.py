@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QToolBar, QWidget,
 )
 
-from ..database import Server, add_server, delete_server, get_all_servers, update_server
+from ..database import Server, add_server, delete_server, get_all_servers, save_server_order, update_server
 from .add_server_dialog import AddServerDialog
 from .server_card import ServerCard
 
@@ -145,6 +145,7 @@ class MainWindow(QMainWindow):
         card.status_changed.connect(self._update_status)
         card.edit_requested.connect(self._on_edit)
         card.delete_requested.connect(self._on_delete)
+        card.swap_requested.connect(self._on_swap)
 
         row, col = divmod(index, self._cols)
         self._grid.addWidget(card, row, col)
@@ -217,6 +218,14 @@ class MainWindow(QMainWindow):
         delete_server(server_id)
         self._rebuild_grid()
         self._update_status()
+
+    def _on_swap(self, from_id: int, to_id: int) -> None:
+        keys = list(self._cards.keys())
+        fi, ti = keys.index(from_id), keys.index(to_id)
+        keys[fi], keys[ti] = keys[ti], keys[fi]
+        self._cards = {k: self._cards[k] for k in keys}
+        self._rebuild_grid()
+        save_server_order(keys)
 
     def _on_refresh_all(self) -> None:
         for card in self._cards.values():

@@ -12,10 +12,10 @@ matplotlib.use("Qt5Agg")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QThread, QPoint, QMimeData, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QDrag, QFont
 from PyQt5.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
@@ -123,28 +123,25 @@ class _MiniGraph(FigureCanvasQTAgg):
 # ──────────────────────────────────────────────
 
 class ServerCard(QFrame):
-    status_changed  = pyqtSignal()
-    edit_requested  = pyqtSignal(int)
+    status_changed   = pyqtSignal()
+    edit_requested   = pyqtSignal(int)
     delete_requested = pyqtSignal(int)
+    swap_requested   = pyqtSignal(int, int)  # from_server_id, to_server_id
 
     def __init__(self, server: Server, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.server       = server
         self.is_connected = False
         self._thread: Optional[_MonitorThread] = None
+        self._drag_start_pos: Optional[QPoint] = None
 
         self.setFrameStyle(QFrame.Box | QFrame.Raised)
         self.setLineWidth(1)
         self.setMinimumWidth(280)
         # Sin máximo: la tarjeta se expande para llenar la columna
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setStyleSheet(
-            "ServerCard {"
-            "  background-color: #252526;"
-            "  border: 1px solid #3e3e42;"
-            "  border-radius: 8px;"
-            "}"
-        )
+        self.setAcceptDrops(True)
+        self._apply_style(False)
         self._build_ui()
         if not server.monitoring_enabled:
             self._lbl_err.setText("Monitoreo pausado")
@@ -159,6 +156,14 @@ class ServerCard(QFrame):
 
         # ── cabecera ──
         hdr = QHBoxLayout()
+
+        # handle de arrastre
+        self._handle = QLabel("⠿")
+        self._handle.setFixedWidth(16)
+        self._handle.setStyleSheet("color: #444; font-size: 15px;")
+        self._handle.setCursor(Qt.SizeAllCursor)
+        self._handle.setToolTip("Arrastra para reordenar")
+
         self._dot = QLabel("●")
         self._dot.setFixedWidth(18)
         self._set_dot(False)
@@ -169,6 +174,7 @@ class ServerCard(QFrame):
         self._lbl_host = QLabel(f"{self.server.host}:{self.server.port}")
         self._lbl_host.setStyleSheet("color: #777777; font-size: 10px;")
 
+        hdr.addWidget(self._handle)
         hdr.addWidget(self._dot)
         hdr.addWidget(self._lbl_name)
         hdr.addStretch()
@@ -276,6 +282,13 @@ class ServerCard(QFrame):
 
     # ── utilidades de UI ─────────────────────────
 
+    def _apply_style(self, highlight: bool) -> None:
+        border = "#61dafb" if highlight else "#3e3e42"
+        width  = "2px"     if highlight else "1px"
+        self.setStyleSheet(
+            f"ServerCard {{ background-color:#252526; border:{width} solid {border}; border-radius:8px; }}"
+        )
+
     def update_header(self) -> None:
         self._lbl_name.setText(self.server.name)
         self._lbl_host.setText(f"{self.server.host}:{self.server.port}")
@@ -347,6 +360,53 @@ class ServerCard(QFrame):
     def force_refresh(self) -> None:
         self.stop_monitoring()
         self.start_monitoring()
+
+    # ── drag & drop para reordenar ───────────────
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_start_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_start_pos is None or not (event.buttons() & Qt.LeftButton):
+            self._drag_start_pos = None
+            return
+        dist = (event.pos() - self._drag_start_pos).manhattanLength()
+        if dist < QApplication.startDragDistance():
+            return
+
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setText(str(self.server.id))
+        drag.setMimeData(mime)
+
+        pix = self.grab().scaled(220, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        drag.setPixmap(pix)
+        drag.setHotSpot(QPoint(pix.width() // 2, 20))
+
+        self._drag_start_pos = None
+        drag.exec_(Qt.MoveAction)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasText() and event.source() is not self:
+            event.acceptProposedAction()
+            self._apply_style(True)
+
+    def dragLeaveEvent(self, event) -> None:
+        self._apply_style(False)
+
+    def dropEvent(self, event) -> None:
+        self._apply_style(False)
+        if event.mimeData().hasText():
+            src_id = int(event.mimeData().text())
+            if src_id != self.server.id:
+                self.swap_requested.emit(src_id, self.server.id)
+            event.acceptProposedAction()
 
     # ── control del monitoreo ────────────────────
 

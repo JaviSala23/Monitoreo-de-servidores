@@ -74,9 +74,12 @@ def init_db() -> None:
             ("db_user",            "TEXT    NOT NULL DEFAULT ''"),
             ("db_password",        "TEXT    NOT NULL DEFAULT ''"),
             ("monitoring_enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ("sort_order",         "INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in existing:
                 conn.execute(f"ALTER TABLE servers ADD COLUMN {col} {dfn}")
+                if col == "sort_order":
+                    conn.execute("UPDATE servers SET sort_order = rowid")
         conn.commit()
 
 
@@ -86,7 +89,7 @@ def get_all_servers() -> List[Server]:
             "SELECT id, name, host, port, username, password, description, "
             "cpu_alert, ram_alert, disk_alert, "
             "db_type, db_port, db_name, db_user, db_password, monitoring_enabled "
-            "FROM servers ORDER BY name"
+            "FROM servers ORDER BY sort_order, name"
         ).fetchall()
     return [
         Server(
@@ -152,4 +155,11 @@ def set_monitoring_enabled(server_id: int, enabled: bool) -> None:
             "UPDATE servers SET monitoring_enabled=? WHERE id=?",
             (1 if enabled else 0, server_id),
         )
+        conn.commit()
+
+
+def save_server_order(server_ids: List[int]) -> None:
+    with _get_connection() as conn:
+        for i, sid in enumerate(server_ids):
+            conn.execute("UPDATE servers SET sort_order=? WHERE id=?", (i, sid))
         conn.commit()

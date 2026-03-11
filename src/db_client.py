@@ -1,10 +1,16 @@
 """
 Cliente de bases de datos remotas con túnel SSH.
 Soporta: PostgreSQL, MySQL, MongoDB, Redis.
-Las importaciones de cada driver son lazy: sólo fallan si usas ese motor concreto.
+El túnel se implementa directamente con paramiko (sin sshtunnel),
+compatible con paramiko 3.x.
 """
+import select
+import socket
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
+
+import paramiko
 
 _DEFAULT_PORTS: Dict[str, int] = {
     "postgresql": 5432,
@@ -23,12 +29,119 @@ class DBResult:
     message:  str         = ""
 
 
+# ── Túnel SSH puro con paramiko ───────────────────────────────────────────────
+
+class _SSHTunnel:
+    """
+    Túnel SSH implementado directamente con paramiko.Transport.
+    Abre un puerto local libre y reenvía el tráfico a (remote_host, remote_port)
+    a través del servidor SSH.
+    """
+
+    def __init__(self, ssh_host: str, ssh_port: int,
+                 ssh_user: str, ssh_pass: str,
+                 remote_host: str, remote_port: int) -> None:
+        self._ssh_host    = ssh_host
+        self._ssh_port    = ssh_port
+        self._ssh_user    = ssh_user
+        self._ssh_pass    = ssh_pass
+        self._remote_host = remote_host
+        self._remote_port = remote_port
+
+        self._transport: Optional[paramiko.Transport] = None
+        self._server_sock: Optional[socket.socket]    = None
+        self._running = False
+        self.local_bind_port: int = 0
+
+    def start(self) -> None:
+        self._transport = paramiko.Transport((self._ssh_host, self._ssh_port))
+        self._transport.connect(
+            username=self._ssh_user,
+            password=self._ssh_pass,
+        )
+
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind(("127.0.0.1", 0))
+        self._server_sock.listen(10)
+        self._server_sock.settimeout(1.0)
+        self.local_bind_port = self._server_sock.getsockname()[1]
+
+        self._running = True
+        t = threading.Thread(target=self._accept_loop, daemon=True)
+        t.start()
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                client_sock, addr = self._server_sock.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+            threading.Thread(
+                target=self._forward,
+                args=(client_sock, addr),
+                daemon=True,
+            ).start()
+
+    def _forward(self, local_sock: socket.socket, addr) -> None:
+        try:
+            chan = self._transport.open_channel(
+                "direct-tcpip",
+                (self._remote_host, self._remote_port),
+                addr,
+            )
+        except Exception:
+            local_sock.close()
+            return
+        try:
+            while True:
+                r, _, _ = select.select([local_sock, chan], [], [], 5.0)
+                if local_sock in r:
+                    data = local_sock.recv(4096)
+                    if not data:
+                        break
+                    chan.sendall(data)
+                if chan in r:
+                    data = chan.recv(4096)
+                    if not data:
+                        break
+                    local_sock.sendall(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                local_sock.close()
+            except Exception:
+                pass
+            try:
+                chan.close()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._running = False
+        if self._server_sock:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+        if self._transport:
+            try:
+                self._transport.close()
+            except Exception:
+                pass
+
+
+# ── DBClient ──────────────────────────────────────────────────────────────────
+
 class DBClient:
-    """Conexión a BD remota a través de túnel SSH."""
+    """Conexión a BD remota a través de túnel SSH (paramiko nativo)."""
 
     def __init__(self, server) -> None:   # server: database.Server
         self._server = server
-        self._tunnel = None
+        self._tunnel: Optional[_SSHTunnel] = None
         self._conn   = None
         self._type   = server.db_type.lower()
 
@@ -73,12 +186,13 @@ class DBClient:
     # ── tunnel + conexión ──────────────────────────────────────────────────
 
     def _open_tunnel(self) -> None:
-        from sshtunnel import SSHTunnelForwarder   # type: ignore
-        self._tunnel = SSHTunnelForwarder(
-            (self._server.host, self._server.port),
-            ssh_username=self._server.username,
-            ssh_password=self._server.password,
-            remote_bind_address=("127.0.0.1", self._eff_port),
+        self._tunnel = _SSHTunnel(
+            ssh_host=self._server.host,
+            ssh_port=self._server.port,
+            ssh_user=self._server.username,
+            ssh_pass=self._server.password,
+            remote_host="127.0.0.1",
+            remote_port=self._eff_port,
         )
         self._tunnel.start()
 
