@@ -1,0 +1,4 @@
+PyQt5>=5.15.0
+paramiko>=3.0.0
+matplotlib>=3.5.0
+cryptography>=40.0.0
