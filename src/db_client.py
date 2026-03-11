@@ -364,7 +364,6 @@ class DBClient:
                                 message=f"{cur.rowcount} fila(s) afectadas")
 
             elif self._type == "mongodb":
-                # query = nombre de colección; muestra hasta 100 documentos
                 db   = self._conn[self._server.db_name or "admin"]
                 docs = list(db[query.strip()].find().limit(100))
                 if not docs:
@@ -381,6 +380,254 @@ class DBClient:
                 if isinstance(result, list):
                     return DBResult(columns=["Resultado"],
                                     rows=[(r,) for r in result[:200]])
+                return DBResult(columns=["Resultado"], rows=[(str(result),)])
+
+        except Exception as exc:
+            return DBResult(error=str(exc))
+
+        return DBResult()
+
+    # ── exploración paginada ───────────────────────────────────────────────
+
+    def describe_table(self, table_name: str):
+        """Devuelve (DBResult columnas, DBResult índices)."""
+        try:
+            if self._type == "postgresql":
+                cur = self._conn.cursor()
+                cur.execute(
+                    """
+                    SELECT
+                        c.column_name                                               AS "Columna",
+                        c.data_type || CASE
+                            WHEN c.character_maximum_length IS NOT NULL
+                            THEN '(' || c.character_maximum_length || ')'
+                            ELSE '' END                                             AS "Tipo",
+                        c.is_nullable                                               AS "Nulable",
+                        COALESCE((
+                            SELECT '✓'
+                            FROM information_schema.key_column_usage k
+                            JOIN information_schema.table_constraints tc
+                                ON k.constraint_name = tc.constraint_name
+                               AND k.table_name      = tc.table_name
+                            WHERE tc.constraint_type = 'PRIMARY KEY'
+                              AND k.table_name        = c.table_name
+                              AND k.column_name       = c.column_name
+                            LIMIT 1
+                        ), '')                                                      AS "PK",
+                        COALESCE(c.column_default, '')                             AS "Default"
+                    FROM information_schema.columns c
+                    WHERE c.table_name = %s
+                    ORDER BY c.ordinal_position
+                    """,
+                    (table_name,),
+                )
+                cols = DBResult(columns=[d[0] for d in cur.description],
+                                rows=cur.fetchall())
+                cur.execute(
+                    "SELECT indexname AS \"Índice\", indexdef AS \"Definición\" "
+                    "FROM pg_indexes WHERE tablename = %s ORDER BY indexname",
+                    (table_name,),
+                )
+                idxs = DBResult(columns=[d[0] for d in cur.description],
+                                rows=cur.fetchall())
+                return cols, idxs
+
+            elif self._type == "mysql":
+                cur = self._conn.cursor()
+                cur.execute(
+                    "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, "
+                    "COLUMN_KEY, COLUMN_DEFAULT, EXTRA "
+                    "FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+                    "ORDER BY ORDINAL_POSITION",
+                    (table_name,),
+                )
+                cols = DBResult(
+                    columns=["Columna", "Tipo", "Nulable", "Clave", "Default", "Extra"],
+                    rows=cur.fetchall(),
+                )
+                safe = table_name.replace("`", "")
+                cur.execute(f"SHOW INDEX FROM `{safe}`")
+                idxs = DBResult(
+                    columns=[d[0] for d in cur.description] if cur.description else [],
+                    rows=cur.fetchall(),
+                )
+                return cols, idxs
+
+            elif self._type == "mongodb":
+                db   = self._conn[self._server.db_name or "admin"]
+                coll = db[table_name]
+                doc  = coll.find_one()
+                if doc:
+                    cols = DBResult(
+                        columns=["Campo", "Tipo Python", "Ejemplo"],
+                        rows=[(k, type(v).__name__, str(v)[:80])
+                              for k, v in doc.items()],
+                    )
+                else:
+                    cols = DBResult(columns=["Info"], rows=[("Colección vacía",)])
+                idx_info = coll.index_information()
+                idxs = DBResult(
+                    columns=["Nombre", "Clave", "Único"],
+                    rows=[
+                        (name,
+                         str(info.get("key", "")),
+                         "✓" if info.get("unique") else "")
+                        for name, info in idx_info.items()
+                    ],
+                )
+                return cols, idxs
+
+            elif self._type == "redis":
+                exists = self._conn.exists(table_name)
+                if exists:
+                    ktype    = self._conn.type(table_name)
+                    ttl      = self._conn.ttl(table_name)
+                    try:    enc = self._conn.object("encoding", table_name)
+                    except Exception: enc = "?"
+                    cols = DBResult(
+                        columns=["Propiedad", "Valor"],
+                        rows=[("Tipo", ktype), ("TTL (seg)", str(ttl)),
+                              ("Encoding", str(enc))],
+                    )
+                else:
+                    cols = DBResult(columns=["Info"], rows=[("Clave no encontrada",)])
+                idxs = DBResult(columns=["Nota"], rows=[("Redis no tiene índices",)])
+                return cols, idxs
+
+        except Exception as exc:
+            err = DBResult(error=str(exc))
+            return err, DBResult()
+
+        return DBResult(), DBResult()
+
+    def count_rows(self, table_name: str) -> int:
+        """Estimación rápida del número de filas/documentos. -1 si error."""
+        try:
+            if self._type == "postgresql":
+                cur = self._conn.cursor()
+                cur.execute(
+                    "SELECT reltuples::bigint FROM pg_class WHERE relname = %s",
+                    (table_name,),
+                )
+                row = cur.fetchone()
+                return max(0, int(row[0])) if row else 0
+
+            elif self._type == "mysql":
+                cur = self._conn.cursor()
+                cur.execute(
+                    "SELECT TABLE_ROWS FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+                    (table_name,),
+                )
+                row = cur.fetchone()
+                return max(0, int(row[0])) if row and row[0] is not None else 0
+
+            elif self._type == "mongodb":
+                db = self._conn[self._server.db_name or "admin"]
+                return db[table_name].estimated_document_count()
+
+            elif self._type == "redis":
+                ktype = self._conn.type(table_name)
+                if ktype == "list":   return self._conn.llen(table_name)
+                if ktype == "hash":   return self._conn.hlen(table_name)
+                if ktype == "set":    return self._conn.scard(table_name)
+                if ktype == "zset":   return self._conn.zcard(table_name)
+                return 1
+
+        except Exception:
+            return -1
+        return -1
+
+    def browse_table(self, table_name: str,
+                     page: int, page_size: int) -> DBResult:
+        """Devuelve una página de filas de una tabla."""
+        try:
+            offset = page * page_size
+
+            if self._type == "postgresql":
+                from psycopg2 import sql as pgsql  # type: ignore
+                cur = self._conn.cursor()
+                cur.execute(
+                    pgsql.SQL("SELECT * FROM {} LIMIT %s OFFSET %s").format(
+                        pgsql.Identifier(table_name)
+                    ),
+                    (page_size, offset),
+                )
+                cols = [d[0] for d in cur.description]
+                return DBResult(columns=cols, rows=cur.fetchall())
+
+            elif self._type == "mysql":
+                safe = table_name.replace("`", "")
+                cur  = self._conn.cursor()
+                cur.execute(
+                    f"SELECT * FROM `{safe}` LIMIT %s OFFSET %s",
+                    (page_size, offset),
+                )
+                cols = [d[0] for d in cur.description]
+                return DBResult(columns=cols, rows=cur.fetchall())
+
+            elif self._type == "mongodb":
+                db   = self._conn[self._server.db_name or "admin"]
+                docs = list(db[table_name].find().skip(offset).limit(page_size))
+                if not docs:
+                    return DBResult(columns=["Info"],
+                                    rows=[("Sin más documentos",)])
+                keys = list(docs[0].keys())
+                rows = [tuple(str(d.get(k, "")) for k in keys) for d in docs]
+                return DBResult(columns=keys, rows=rows)
+
+            elif self._type == "redis":
+                keys = self._conn.keys("*")
+                page_keys = keys[offset: offset + page_size]
+                rows = [(k, self._conn.type(k)) for k in page_keys]
+                return DBResult(columns=["Key", "Tipo"], rows=rows)
+
+        except Exception as exc:
+            return DBResult(error=str(exc))
+
+        return DBResult()
+
+    def execute_read_query(self, query: str,
+                           page: int, page_size: int) -> DBResult:
+        """Ejecuta una consulta (solo lectura) con paginación automática."""
+        import re
+        q = query.strip().rstrip(";")
+        if re.match(r"^\s*(delete|drop|truncate)\b", q, re.I):
+            kw = q.split()[0].upper()
+            return DBResult(error=f"🚫 {kw} está bloqueado — esta herramienta es de solo lectura")
+
+        try:
+            if self._type in ("postgresql", "mysql"):
+                # Paginar automáticamente SELECT sin LIMIT
+                is_select = bool(re.match(r"^\s*select\b", q, re.I))
+                has_limit = bool(re.search(r"\blimit\b", q, re.I))
+                if is_select and not has_limit:
+                    q = f"{q} LIMIT {page_size} OFFSET {page * page_size}"
+                cur = self._conn.cursor()
+                cur.execute(q)
+                if cur.description:
+                    cols = [d[0] for d in cur.description]
+                    return DBResult(columns=cols,
+                                    rows=cur.fetchall()[:page_size])
+                if self._type == "postgresql":
+                    self._conn.commit()
+                else:
+                    self._conn.commit()
+                return DBResult(message=f"{cur.rowcount} fila(s) afectadas")
+
+            elif self._type == "mongodb":
+                return self.browse_table(q, page, page_size)
+
+            elif self._type == "redis":
+                parts  = q.split(maxsplit=1)
+                cmd    = parts[0].upper()
+                args   = parts[1].split() if len(parts) > 1 else []
+                result = self._conn.execute_command(cmd, *args)
+                if isinstance(result, list):
+                    sliced = result[page * page_size: (page + 1) * page_size]
+                    return DBResult(columns=["Resultado"],
+                                    rows=[(r,) for r in sliced])
                 return DBResult(columns=["Resultado"], rows=[(str(result),)])
 
         except Exception as exc:

@@ -241,6 +241,9 @@ class ServerCard(QFrame):
         b_tools = _icon_btn("🔧", "Caja de herramientas: comandos rápidos y personalizados")
         b_tools.clicked.connect(self._open_tools)
 
+        b_conn = _icon_btn("🌐", "Ver conexiones activas: sesiones SSH, IPs, accesos web")
+        b_conn.clicked.connect(self._open_connections)
+
         b_db = _icon_btn("🗄", "Gestionar base de datos remota")
         b_db.clicked.connect(self._open_db_manager)
         b_db.setVisible(bool(self.server.db_type))
@@ -253,7 +256,7 @@ class ServerCard(QFrame):
         b_del.setObjectName("btn_danger")
         b_del.clicked.connect(lambda: self.delete_requested.emit(self.server.id))
 
-        for w in (b_ssh, b_toggle, b_tools, b_db, b_edit):
+        for w in (b_ssh, b_toggle, b_tools, b_conn, b_db, b_edit):
             btns.addWidget(w)
         btns.addStretch()
         btns.addWidget(b_del)
@@ -438,6 +441,11 @@ class ServerCard(QFrame):
     def _open_tools(self) -> None:
         from .tools_dialog import ToolsDialog
         dlg = ToolsDialog(self.server, parent=self)
+        dlg.show()
+
+    def _open_connections(self) -> None:
+        from .connections_dialog import ConnectionsDialog
+        dlg = ConnectionsDialog(self.server, parent=self)
         dlg.show()
 
     def _open_terminal(self) -> None:
