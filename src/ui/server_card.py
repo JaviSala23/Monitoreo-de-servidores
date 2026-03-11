@@ -135,8 +135,9 @@ class ServerCard(QFrame):
 
         self.setFrameStyle(QFrame.Box | QFrame.Raised)
         self.setLineWidth(1)
-        self.setMinimumWidth(360)
-        self.setMaximumWidth(520)
+        self.setMinimumWidth(280)
+        # Sin máximo: la tarjeta se expande para llenar la columna
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet(
             "ServerCard {"
             "  background-color: #252526;"

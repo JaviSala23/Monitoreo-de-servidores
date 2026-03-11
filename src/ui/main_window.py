@@ -16,13 +16,18 @@ from .add_server_dialog import AddServerDialog
 from .server_card import ServerCard
 
 
+# Ancho mínimo de cada tarjeta para calcular columnas dinámicas
+_CARD_MIN_W = 300
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Server Monitor — Dashboard")
-        self.setMinimumSize(1100, 650)
+        self.setMinimumSize(700, 550)
 
         self._cards: Dict[int, ServerCard] = {}
+        self._cols: int = 3
 
         self._build_toolbar()
         self._build_central()
@@ -58,6 +63,8 @@ class MainWindow(QMainWindow):
     # ── central ──────────────────────────────────
 
     def _build_central(self) -> None:
+        from PyQt5.QtWidgets import QVBoxLayout
+
         # Header
         header = QLabel("🖥  Server Monitor Dashboard")
         header.setFont(QFont("Ubuntu", 16, QFont.Bold))
@@ -68,11 +75,15 @@ class MainWindow(QMainWindow):
         self._grid_widget = QWidget()
         self._grid = QGridLayout(self._grid_widget)
         self._grid.setSpacing(12)
+        self._grid.setContentsMargins(10, 10, 10, 10)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
-        scroll = QScrollArea()
-        scroll.setWidget(self._grid_widget)
-        scroll.setWidgetResizable(True)
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(self._grid_widget)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setFrameShape(self._scroll.NoFrame)
 
         # Placeholder cuando no hay servidores
         self._empty_label = QLabel(
@@ -83,12 +94,12 @@ class MainWindow(QMainWindow):
         self._empty_label.setStyleSheet("color: #555555; font-size: 14px;")
 
         container = QWidget()
-        from PyQt5.QtWidgets import QVBoxLayout
         vbox = QVBoxLayout(container)
         vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
         vbox.addWidget(header)
         vbox.addWidget(self._empty_label)
-        vbox.addWidget(scroll)
+        vbox.addWidget(self._scroll, 1)   # stretch=1 → ocupa todo el espacio sobrante
         self.setCentralWidget(container)
 
     # ── status bar ───────────────────────────────
@@ -121,7 +132,13 @@ class MainWindow(QMainWindow):
 
     # ── helpers ───────────────────────────────────
 
-    _COLS = 3          # columnas del grid
+    def _calc_cols(self) -> int:
+        """Calcula cuántas columnas caben según el ancho actual del scroll."""
+        spacing = self._grid.spacing()
+        margins = self._grid.contentsMargins()
+        available = self._scroll.viewport().width() - margins.left() - margins.right()
+        cols = max(1, (available + spacing) // (_CARD_MIN_W + spacing))
+        return cols
 
     def _add_card(self, server: Server, index: int) -> None:
         card = ServerCard(server, self)
@@ -129,17 +146,31 @@ class MainWindow(QMainWindow):
         card.edit_requested.connect(self._on_edit)
         card.delete_requested.connect(self._on_delete)
 
-        row, col = divmod(index, self._COLS)
+        row, col = divmod(index, self._cols)
         self._grid.addWidget(card, row, col)
+        self._grid.setColumnStretch(col, 1)
         self._cards[server.id] = card
         card.start_monitoring()
 
     def _rebuild_grid(self) -> None:
         for card in self._cards.values():
             self._grid.removeWidget(card)
+        # Resetear stretch de columnas anteriores
+        for c in range(self._grid.columnCount()):
+            self._grid.setColumnStretch(c, 0)
         for i, card in enumerate(self._cards.values()):
-            row, col = divmod(i, self._COLS)
+            row, col = divmod(i, self._cols)
             self._grid.addWidget(card, row, col)
+        # Distribuir el ancho disponible en partes iguales
+        for c in range(self._cols):
+            self._grid.setColumnStretch(c, 1)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        new_cols = self._calc_cols()
+        if new_cols != self._cols:
+            self._cols = new_cols
+            self._rebuild_grid()
 
     # ── acciones ─────────────────────────────────
 

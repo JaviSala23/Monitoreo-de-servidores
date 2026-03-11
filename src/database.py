@@ -20,7 +20,17 @@ class Server:
     port: int
     username: str
     password: str        # Texto plano cuando está en uso
-    description: str = ""
+    description: str  = ""
+    # Umbrales de alerta (0.0 = desactivado)
+    cpu_alert:  float = 85.0
+    ram_alert:  float = 90.0
+    disk_alert: float = 90.0
+    # Configuración de base de datos remota
+    db_type:     str = ""    # "postgresql" | "mysql" | "mongodb" | "redis" | ""
+    db_port:     int = 0     # 0 = usar el puerto por defecto del motor
+    db_name:     str = ""
+    db_user:     str = ""
+    db_password: str = ""    # texto plano en uso, cifrado en disco
 
 
 def _get_connection() -> sqlite3.Connection:
@@ -39,22 +49,51 @@ def init_db() -> None:
                 port        INTEGER NOT NULL DEFAULT 22,
                 username    TEXT    NOT NULL,
                 password    TEXT    NOT NULL,
-                description TEXT    NOT NULL DEFAULT ''
+                description TEXT    NOT NULL DEFAULT '',
+                cpu_alert   REAL    NOT NULL DEFAULT 85.0,
+                ram_alert   REAL    NOT NULL DEFAULT 90.0,
+                disk_alert  REAL    NOT NULL DEFAULT 90.0,
+                db_type     TEXT    NOT NULL DEFAULT '',
+                db_port     INTEGER NOT NULL DEFAULT 0,
+                db_name     TEXT    NOT NULL DEFAULT '',
+                db_user     TEXT    NOT NULL DEFAULT '',
+                db_password TEXT    NOT NULL DEFAULT ''
             )
             """
         )
+        # Migración automática: agrega columnas si la DB ya existía
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(servers)")}
+        for col, dfn in [
+            ("cpu_alert",   "REAL    NOT NULL DEFAULT 85.0"),
+            ("ram_alert",   "REAL    NOT NULL DEFAULT 90.0"),
+            ("disk_alert",  "REAL    NOT NULL DEFAULT 90.0"),
+            ("db_type",     "TEXT    NOT NULL DEFAULT ''"),
+            ("db_port",     "INTEGER NOT NULL DEFAULT 0"),
+            ("db_name",     "TEXT    NOT NULL DEFAULT ''"),
+            ("db_user",     "TEXT    NOT NULL DEFAULT ''"),
+            ("db_password", "TEXT    NOT NULL DEFAULT ''"),
+        ]:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE servers ADD COLUMN {col} {dfn}")
         conn.commit()
 
 
 def get_all_servers() -> List[Server]:
     with _get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, name, host, port, username, password, description FROM servers ORDER BY name"
+            "SELECT id, name, host, port, username, password, description, "
+            "cpu_alert, ram_alert, disk_alert, "
+            "db_type, db_port, db_name, db_user, db_password "
+            "FROM servers ORDER BY name"
         ).fetchall()
     return [
         Server(
             id=r[0], name=r[1], host=r[2], port=r[3],
             username=r[4], password=decrypt_password(r[5]), description=r[6],
+            cpu_alert=float(r[7]), ram_alert=float(r[8]), disk_alert=float(r[9]),
+            db_type=r[10] or "", db_port=int(r[11]),
+            db_name=r[12] or "", db_user=r[13] or "",
+            db_password=decrypt_password(r[14]) if r[14] else "",
         )
         for r in rows
     ]
