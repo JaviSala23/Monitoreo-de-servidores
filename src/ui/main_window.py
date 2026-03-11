@@ -190,6 +190,7 @@ class MainWindow(QMainWindow):
         if dlg.exec_():
             updated = dlg.get_server()
             updated.id = server_id
+            updated.monitoring_enabled = card.server.monitoring_enabled
             update_server(updated)
             card.server = updated
             card.update_header()

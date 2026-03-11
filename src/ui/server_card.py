@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from ..database import Server
+from ..database import Server, set_monitoring_enabled
 from ..monitor import ServerMetrics, ServerMonitor
 from ..ssh_client import SSHClient
 
@@ -146,6 +146,9 @@ class ServerCard(QFrame):
             "}"
         )
         self._build_ui()
+        if not server.monitoring_enabled:
+            self._lbl_err.setText("Monitoreo pausado")
+            self._lbl_info.setText("")
 
     # ── construcción de la interfaz ──────────────
 
@@ -200,21 +203,52 @@ class ServerCard(QFrame):
         root.addWidget(self._g_ram)
         root.addWidget(self._g_net)
 
-        # ── botones ──
+        # ── botones (solo iconos + tooltip) ──
+        _ICON_BTN = (
+            "QPushButton { min-width:28px; max-width:28px; min-height:26px;"
+            " font-size:14px; padding:2px; border-radius:4px; }"
+        )
+
+        def _icon_btn(icon: str, tip: str, danger: bool = False) -> QPushButton:
+            b = QPushButton(icon)
+            b.setToolTip(tip)
+            b.setStyleSheet(
+                _ICON_BTN + (
+                    " QPushButton { color:#ff6b6b; }"
+                    " QPushButton:hover { background:#3a1a1a; border-color:#ff6b6b; }"
+                    if danger else ""
+                )
+            )
+            return b
+
         btns = QHBoxLayout()
-        b_ssh  = QPushButton("💻 SSH")
-        b_ssh.setToolTip("Abrir terminal SSH")
+        btns.setSpacing(3)
+
+        b_ssh = _icon_btn("💻", "Abrir terminal SSH")
         b_ssh.clicked.connect(self._open_terminal)
 
-        b_edit = QPushButton("✏ Editar")
+        b_toggle = _icon_btn("⏸" if self.server.monitoring_enabled else "▶",
+                              "Pausar monitoreo" if self.server.monitoring_enabled else "Reanudar monitoreo")
+        b_toggle.clicked.connect(self._toggle_monitoring)
+        self._btn_toggle = b_toggle
+
+        b_tools = _icon_btn("🔧", "Caja de herramientas: comandos rápidos y personalizados")
+        b_tools.clicked.connect(self._open_tools)
+
+        b_db = _icon_btn("🗄", "Gestionar base de datos remota")
+        b_db.clicked.connect(self._open_db_manager)
+        b_db.setVisible(bool(self.server.db_type))
+        self._btn_db = b_db
+
+        b_edit = _icon_btn("✏", "Editar servidor")
         b_edit.clicked.connect(lambda: self.edit_requested.emit(self.server.id))
 
-        b_del  = QPushButton("🗑 Eliminar")
+        b_del = _icon_btn("🗑", "Eliminar servidor", danger=True)
         b_del.setObjectName("btn_danger")
         b_del.clicked.connect(lambda: self.delete_requested.emit(self.server.id))
 
-        btns.addWidget(b_ssh)
-        btns.addWidget(b_edit)
+        for w in (b_ssh, b_toggle, b_tools, b_db, b_edit):
+            btns.addWidget(w)
         btns.addStretch()
         btns.addWidget(b_del)
         root.addLayout(btns)
@@ -245,6 +279,7 @@ class ServerCard(QFrame):
     def update_header(self) -> None:
         self._lbl_name.setText(self.server.name)
         self._lbl_host.setText(f"{self.server.host}:{self.server.port}")
+        self._btn_db.setVisible(bool(self.server.db_type))
 
     def _set_dot(self, connected: bool) -> None:
         color = "#4caf50" if connected else "#f44336"
@@ -297,6 +332,8 @@ class ServerCard(QFrame):
     # ── control del hilo ─────────────────────────
 
     def start_monitoring(self) -> None:
+        if not self.server.monitoring_enabled:
+            return
         self._thread = _MonitorThread(self.server)
         self._thread.metrics_ready.connect(self._on_metrics_ready)
         self._thread.connection_changed.connect(self._on_connection_changed)
@@ -311,7 +348,37 @@ class ServerCard(QFrame):
         self.stop_monitoring()
         self.start_monitoring()
 
+    # ── control del monitoreo ────────────────────
+
+    def _toggle_monitoring(self) -> None:
+        self.server.monitoring_enabled = not self.server.monitoring_enabled
+        set_monitoring_enabled(self.server.id, self.server.monitoring_enabled)
+        if self.server.monitoring_enabled:
+            self._btn_toggle.setText("⏸")
+            self._btn_toggle.setToolTip("Pausar monitoreo")
+            self._lbl_err.setText("")
+            self.start_monitoring()
+        else:
+            self._btn_toggle.setText("▶")
+            self._btn_toggle.setToolTip("Reanudar monitoreo")
+            self.stop_monitoring()
+            self._set_dot(False)
+            self._lbl_err.setText("Monitoreo pausado")
+            self._lbl_info.setText("")
+            self.is_connected = False
+            self.status_changed.emit()
+
     # ── abrir terminal SSH ───────────────────────
+
+    def _open_db_manager(self) -> None:
+        from .db_dialog import DBDialog
+        dlg = DBDialog(self.server, parent=self)
+        dlg.show()
+
+    def _open_tools(self) -> None:
+        from .tools_dialog import ToolsDialog
+        dlg = ToolsDialog(self.server, parent=self)
+        dlg.show()
 
     def _open_terminal(self) -> None:
         user = self.server.username

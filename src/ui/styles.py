@@ -66,6 +66,15 @@ QPushButton#btn_danger:hover {
     border-color: #ff6b6b;
 }
 
+QPushButton#btn_warning {
+    color: #f9c74f;
+}
+
+QPushButton#btn_warning:hover {
+    background-color: #3a2f00;
+    border-color: #f9c74f;
+}
+
 QScrollArea {
     border: none;
     background-color: #1e1e1e;
