@@ -3,6 +3,8 @@ Panel de monitoreo de conexiones activas.
 Muestra: sesiones SSH/TTY, últimos accesos, conexiones TCP activas
 y conexiones web (nginx/apache).  Solo lectura, sin modificaciones.
 """
+import json
+import urllib.request
 from typing import Optional
 
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -34,15 +36,36 @@ class _FetchThread(QThread):
         self.done.emit(self._tag, out if out else f"(sin datos)\n{err}")
 
 
+class _GeoThread(QThread):
+    """Resuelve geolocalización de IPs públicas en segundo plano."""
+    done = pyqtSignal(str, dict)  # (tag, {ip: 'País / Ciudad'})
+
+    def __init__(self, tag: str, ips: list[str]) -> None:
+        super().__init__()
+        self._tag = tag
+        self._ips = list(dict.fromkeys(ips))  # deduplica conservando orden
+
+    def run(self) -> None:
+        result = _geolocate_batch(self._ips)
+        self.done.emit(self._tag, result)
+
+
 # ── parsing helpers ───────────────────────────────────────────────────────────
 
 def _parse_who(raw: str) -> list[list[str]]:
-    """Parsea la salida de 'who -a' o 'w --no-header'."""
+    """Parsea la salida de 'w --no-header' o 'who'."""
+    _TTY_PREFIXES = ("pts/", "tty", "console", "vc/", ":")
     rows = []
     for line in raw.splitlines():
         parts = line.split()
-        if len(parts) >= 3:
-            rows.append(parts)
+        # necesita al menos user + tty + from/date
+        if len(parts) < 3:
+            continue
+        # filtrar líneas de ruido de 'who -a' ("system boot", "run-level", etc.)
+        tty = parts[1]
+        if not any(tty.startswith(p) for p in _TTY_PREFIXES):
+            continue
+        rows.append(parts)
     return rows
 
 
@@ -86,6 +109,58 @@ def _parse_access_log(raw: str) -> list[list[str]]:
     return rows
 
 
+def _geolocate_batch(ips: list[str]) -> dict[str, str]:
+    """
+    Consulta ip-api.com (gratuito) para obtener país y ciudad de IPs públicas.
+    Retorna {ip: 'País / Ciudad'} o {} si falla.
+    """
+    _private = (
+        '10.', '172.16.', '172.17.', '172.18.', '172.19.',
+        '172.2', '172.3', '192.168.', '127.', '::1', 'localhost',
+    )
+    public = [ip for ip in dict.fromkeys(ips)
+              if ip and not any(ip.startswith(p) for p in _private)]
+    if not public:
+        return {}
+    payload = json.dumps(
+        [{"query": ip, "fields": "country,city,query"} for ip in public[:100]]
+    )
+    try:
+        req = urllib.request.Request(
+            "http://ip-api.com/batch?fields=country,city,query",
+            data=payload.encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        return {
+            item["query"]: f"{item.get('country', '?')} / {item.get('city', '?')}"
+            for item in data
+            if item.get("status") == "success"
+        }
+    except Exception:
+        return {}
+
+
+def _extract_ip(addr: str) -> str:
+    """Extrae la IP pura (sin puerto ni brackets) de 'IP:port', '[IPv6]:port' o '::ffff:IP'."""
+    if not addr or addr in ("-", "*", "0.0.0.0"):
+        return ""
+    if addr.startswith("["):
+        # [IPv6]:port
+        ip = addr[1:addr.index("]")] if "]" in addr else addr[1:]
+    elif addr.count(":") == 1:
+        # IPv4:port
+        ip = addr.split(":")[0]
+    else:
+        # IPv6 puro o IPv4 sin puerto
+        ip = addr
+    if ip.startswith("::ffff:") and "." in ip:
+        ip = ip[7:]  # IPv4-mapped IPv6
+    return ip
+
+
 # ── widget de tabla genérico ──────────────────────────────────────────────────
 
 def _make_table(headers: list[str]) -> QTableWidget:
@@ -120,15 +195,30 @@ def _fill_table(widget: QTableWidget, rows: list[list[str]]) -> None:
 # ── comandos remotos ──────────────────────────────────────────────────────────
 
 _CMDS = {
-    "sessions": "w --no-header 2>/dev/null || who -a 2>/dev/null",
+    "sessions": "w --no-header 2>/dev/null || who 2>/dev/null",
     "last":     "last -n 30 -F 2>/dev/null || last -n 30 2>/dev/null",
     "tcp":      "ss -tnp 2>/dev/null || netstat -tnp 2>/dev/null | head -80",
     "udp":      "ss -unp 2>/dev/null | head -60",
     "web":      (
-        "tail -n 40 /var/log/nginx/access.log 2>/dev/null || "
-        "tail -n 40 /var/log/apache2/access.log 2>/dev/null || "
-        "tail -n 40 /var/log/httpd/access_log 2>/dev/null || "
-        "echo 'No se encontró log de acceso web'"
+        # Busca el primer log web con contenido real ([ -s ] = existe Y no-vacío)
+        "_wf=''; "
+        "for _l in "
+        "  /var/log/nginx/access.log /var/log/nginx/*.log "
+        "  /var/log/apache2/access.log /var/log/apache2/*.log "
+        "  /var/log/httpd/access_log /var/log/httpd/access.log; do "
+        "  [ -s \"$_l\" ] && _wf=\"$_l\" && break; "
+        "done 2>/dev/null; "
+        "if [ -n \"$_wf\" ]; then "
+        "  tail -n 100 \"$_wf\"; "
+        "else "
+        "  _af=$(find /var/log -maxdepth 5 -name '*.log' -size +1k 2>/dev/null "
+        "    | xargs grep -rl 'HTTP/' 2>/dev/null | head -1); "
+        "  if [ -n \"$_af\" ]; then "
+        "    echo \"__LOG__$_af\"; tail -n 100 \"$_af\"; "
+        "  else "
+        "    echo '__NO_WEB_LOG__'; "
+        "  fi; "
+        "fi"
     ),
     "failed":   (
         "grep 'Failed password\\|Invalid user\\|authentication failure' "
@@ -150,6 +240,7 @@ class ConnectionsDialog(QDialog):
         self._ssh    = SSHClient(server.host, server.port,
                                  server.username, server.password)
         self._threads: list[_FetchThread] = []
+        self._geo_threads: list[_GeoThread] = []
         self._auto_refresh = False
 
         self.setWindowTitle(f"🌐  Conexiones activas — {server.name}  ({server.host})")
@@ -204,7 +295,7 @@ class ConnectionsDialog(QDialog):
 
         # ── pestaña: Sesiones activas ──
         self._tbl_sessions = _make_table(
-            ["Usuario", "TTY", "IP / Host", "Login", "Idle", "JCPU", "PCPU", "Comando"]
+            ["Usuario", "TTY", "IP / Host", "Login", "Idle", "JCPU", "PCPU", "Comando", "País"]
         )
         self._tabs.addTab(self._wrap(self._tbl_sessions), "👤  Sesiones SSH")
 
@@ -216,19 +307,19 @@ class ConnectionsDialog(QDialog):
 
         # ── pestaña: Conexiones TCP ──
         self._tbl_tcp = _make_table(
-            ["Estado", "Recv-Q", "Send-Q", "Local", "Remoto", "Proceso"]
+            ["Estado", "Recv-Q", "Send-Q", "Local", "Remoto", "Proceso", "País"]
         )
         self._tabs.addTab(self._wrap(self._tbl_tcp), "🔗  Conexiones TCP")
 
         # ── pestaña: Conexiones UDP ──
         self._tbl_udp = _make_table(
-            ["Estado", "Recv-Q", "Send-Q", "Local", "Remoto", "Proceso"]
+            ["Estado", "Recv-Q", "Send-Q", "Local", "Remoto", "Proceso", "País"]
         )
         self._tabs.addTab(self._wrap(self._tbl_udp), "📡  UDP activo")
 
         # ── pestaña: Accesos web ──
         self._tbl_web = _make_table(
-            ["IP", "Usuario", "Fecha", "Método", "Ruta", "Código", "Bytes"]
+            ["IP", "Usuario", "Fecha", "Método", "Ruta", "Código", "Bytes", "País"]
         )
         self._tabs.addTab(self._wrap(self._tbl_web), "🌍  Accesos Web")
 
@@ -237,6 +328,14 @@ class ConnectionsDialog(QDialog):
         self._tabs.addTab(self._wrap(self._tbl_failed, raw=True), "🚨  Intentos fallidos SSH")
 
         root.addWidget(self._tabs, 1)
+
+        # mapa tag → (tabla, columna_ip, columna_país)
+        self._geo_map: dict = {
+            "sessions_geo": (self._tbl_sessions, 2, 8),
+            "tcp_geo":      (self._tbl_tcp,      4, 6),
+            "udp_geo":      (self._tbl_udp,      4, 6),
+            "web_geo":      (self._tbl_web,      0, 7),
+        }
 
         # barra inferior
         bot = QHBoxLayout()
@@ -315,11 +414,13 @@ class ConnectionsDialog(QDialog):
 
     def _on_data(self, tag: str, raw: str) -> None:
         if tag == "sessions":
-            _fill_table(self._tbl_sessions, _parse_who(raw))
+            rows = _parse_who(raw)
+            _fill_table(self._tbl_sessions, rows)
             n = self._tbl_sessions.rowCount()
             tab_idx = 0
             self._tabs.setTabText(tab_idx, f"👤  Sesiones SSH ({n})")
             self._status(f"Sesiones activas: {n}")
+            self._start_geo("sessions_geo", [r[2] for r in rows if len(r) > 2])
 
         elif tag == "last":
             rows = _parse_last(raw)
@@ -331,21 +432,39 @@ class ConnectionsDialog(QDialog):
             _fill_table(self._tbl_tcp, rows)
             n = len(rows)
             self._tabs.setTabText(2, f"🔗  Conexiones TCP ({n})")
+            self._start_geo("tcp_geo", [_extract_ip(r[4]) for r in rows if len(r) > 4])
 
         elif tag == "udp":
             rows = _parse_ss(raw)
             _fill_table(self._tbl_udp, rows)
             self._tabs.setTabText(3, f"📡  UDP activo ({len(rows)})")
+            self._start_geo("udp_geo", [_extract_ip(r[4]) for r in rows if len(r) > 4])
 
         elif tag == "web":
-            if raw.startswith("No se encontró"):
+            no_log = raw.startswith("__NO_WEB_LOG__") or not raw.strip() or raw.startswith("(sin datos)")
+            if no_log:
+                msg = "No se encontró ningún log de acceso web (nginx/apache) con contenido en este servidor."
+                self._tbl_web.setColumnCount(1)
                 self._tbl_web.setRowCount(1)
-                self._tbl_web.setItem(0, 0, QTableWidgetItem(raw))
+                self._tbl_web.setItem(0, 0, QTableWidgetItem(msg))
                 self._tabs.setTabText(4, "🌍  Accesos Web (—)")
+                self._status("Accesos web: sin log encontrado")
             else:
-                rows = _parse_access_log(raw)
-                _fill_table(self._tbl_web, rows)
-                self._tabs.setTabText(4, f"🌍  Accesos Web ({len(rows)})")
+                # quitar la línea informativa __LOG__/ruta si aparece
+                lines = [l for l in raw.splitlines() if not l.startswith("__LOG__")]
+                clean = "\n".join(lines)
+                rows = _parse_access_log(clean)
+                if rows:
+                    _fill_table(self._tbl_web, rows)
+                    self._tabs.setTabText(4, f"🌍  Accesos Web ({len(rows)})")
+                    self._start_geo("web_geo", [r[0] for r in rows if r])
+                else:
+                    # el archivo existe pero el formato no coincide con Combined Log
+                    self._tbl_web.setColumnCount(1)
+                    self._tbl_web.setRowCount(min(50, len(lines)))
+                    for i, line in enumerate(lines[:50]):
+                        self._tbl_web.setItem(i, 0, QTableWidgetItem(line))
+                    self._tabs.setTabText(4, "🌍  Accesos Web (formato desconocido)")
 
         elif tag == "failed":
             lines = [l for l in raw.splitlines() if l.strip()]
@@ -359,7 +478,34 @@ class ConnectionsDialog(QDialog):
                 self._tbl_failed.setItem(r, 0, item)
             self._tbl_failed.resizeColumnsToContents()
             self._tabs.setTabText(5, f"🚨  Intentos fallidos SSH ({len(lines)})")
+    # ── geolocalización ───────────────────────────────────────────────────────
 
+    def _start_geo(self, tag: str, ips: list[str]) -> None:
+        """Lanza un hilo de geolocalización para las IPs dadas."""
+        filtered = [ip for ip in ips if ip and ip not in ("-", "*", "0.0.0.0")]
+        if not filtered:
+            return
+        gt = _GeoThread(tag, filtered)
+        gt.done.connect(self._on_geo)
+        gt.finished.connect(gt.deleteLater)
+        gt.start()
+        self._geo_threads.append(gt)
+
+    def _on_geo(self, tag: str, geo: dict) -> None:
+        """Callback cuando llegan los datos de geolocalización."""
+        if not geo or tag not in self._geo_map:
+            return
+        table, ip_col, geo_col = self._geo_map[tag]
+        for r in range(table.rowCount()):
+            ip_item = table.item(r, ip_col)
+            if ip_item:
+                ip = _extract_ip(ip_item.text())
+                country = geo.get(ip)
+                if country:
+                    item = QTableWidgetItem(country)
+                    item.setForeground(Qt.cyan)
+                    table.setItem(r, geo_col, item)
+        table.resizeColumnsToContents()
     # ── auto-refresh ──────────────────────────────────────────────────────
 
     def _toggle_auto(self, state: int) -> None:
@@ -374,5 +520,8 @@ class ConnectionsDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self._timer.stop()
+        for gt in self._geo_threads:
+            gt.quit()
+            gt.wait(500)
         self._ssh.disconnect()
         event.accept()
